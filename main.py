@@ -5,9 +5,15 @@ import cv2
 import io
 import tempfile
 import os
-import base64 # Import base64 for image encoding (kept for potential future use or debugging, but not directly used for st_canvas background_image in this fix)
-from ultralytics import YOLO # Import YOLO class
-from streamlit_drawable_canvas import st_canvas # Import the drawable canvas component
+import base64
+import rasterio # Import rasterio for GeoTIFF handling and coordinate transformation
+
+# Import torch and torchvision for global NMS
+import torch
+import torchvision.ops as ops 
+
+from ultralytics import YOLO
+from streamlit_drawable_canvas import st_canvas
 
 # --- Function to load YOLO model ---
 @st.cache_resource
@@ -17,6 +23,12 @@ def load_yolo_model(model_path='best.pt'):
     Uses st.cache_resource to cache the model, preventing reloads on every interaction.
     """
     try:
+        # Check if the model file exists
+        if not os.path.exists(model_path):
+            st.error(f"Model file not found at: {model_path}")
+            st.error("Please ensure 'best.pt' is in the same directory as your app.py or provide the full path.")
+            st.stop()
+
         model = YOLO(model_path)
         st.success(f"YOLO model '{model_path}' loaded successfully. Device: {model.device}")
         return model
@@ -60,16 +72,14 @@ def process_image_for_yolo(image_np):
     return image_np
 
 # --- Function to detect trees in ROI by tiling ---
-def detect_trees_in_roi(model, roi_image_np, roi_offset_x, roi_offset_y, TILE_SIZE=640, OVERLAP=100, conf_threshold=0.25, iou_threshold=0.7):
+def detect_trees_in_roi(model, roi_image_np, roi_offset_x, roi_offset_y, transform, TILE_SIZE=640, OVERLAP=100, conf_threshold=0.25, iou_threshold=0.7):
     """
     Detects trees within a specified Region of Interest (ROI) by tiling the ROI
     and running YOLO inference on each tile.
+    Applies global NMS and converts pixel coordinates to geographic coordinates.
     """
-    detected_trees = []
+    all_detections_original_coords = [] # Stores [x_min, y_min, x_max, y_max, confidence, class_id] in original image pixel coords
     roi_height, roi_width, _ = roi_image_np.shape
-
-    # Create a copy of the ROI image for drawing bounding boxes and centers
-    display_roi_image = roi_image_np.copy()
 
     # Iterate through the ROI, creating overlapping tiles
     for y_start_tile in range(0, roi_height, TILE_SIZE - OVERLAP):
@@ -95,55 +105,113 @@ def detect_trees_in_roi(model, roi_image_np, roi_offset_x, roi_offset_y, TILE_SI
             padded_tile[:tile.shape[0], :tile.shape[1], :] = tile
             
             # Perform inference using the YOLO model object
-            # Pass confidence_threshold and iou_threshold from UI
-            results = model(padded_tile, imgsz=TILE_SIZE, conf=conf_threshold, iou=iou_threshold)
+            # NMS is applied per tile here, but we need global NMS later
+            results = model(padded_tile, imgsz=TILE_SIZE, conf=conf_threshold) # Only conf here, IoU for global NMS
 
-            # Process detection results
-            for r in results: # Iterate over results (one per image if not batching)
-                boxes = r.boxes.xyxy.cpu().numpy() # Bounding box coordinates (xmin, ymin, xmax, ymax)
-                confidences = r.boxes.conf.cpu().numpy() # Confidence scores
-                classes = r.boxes.cls.cpu().numpy() # Class IDs
+            # Process detection results for current tile
+            for r in results:
+                boxes = r.boxes.xyxy.cpu().numpy()
+                confidences = r.boxes.conf.cpu().numpy()
+                classes = r.boxes.cls.cpu().numpy()
 
                 for i in range(len(boxes)):
                     x_min_rel, y_min_rel, x_max_rel, y_max_rel = boxes[i]
                     conf = confidences[i]
                     cls_id = int(classes[i])
-                    class_name = model.names[cls_id] # Get class name from model
 
-                    # Coordinates from padded_tile are already relative to the padded input
-                    x_min_on_tile = x_min_rel
-                    y_min_on_tile = y_min_rel
-                    x_max_on_tile = x_max_rel
-                    y_max_on_tile = y_max_rel
-                    
-                    # Convert coordinates from tile to ROI coordinate system
-                    x_min_roi = x_start_tile + x_min_on_tile
-                    y_min_roi = y_start_tile + y_min_on_tile
-                    x_max_roi = x_start_tile + x_max_on_tile
-                    y_max_roi = y_start_tile + y_max_on_tile
+                    # Convert tile-relative coordinates to original image pixel coordinates
+                    x_min_orig = roi_offset_x + x_start_tile + x_min_rel
+                    y_min_orig = roi_offset_y + y_start_tile + y_min_rel
+                    x_max_orig = roi_offset_x + x_start_tile + x_max_rel
+                    y_max_orig = roi_offset_y + y_start_tile + y_max_rel
 
-                    # Convert coordinates from ROI to original image coordinate system
-                    x_min_orig = roi_offset_x + x_min_roi
-                    y_min_orig = roi_offset_y + y_min_roi
-                    x_max_orig = roi_offset_x + x_max_roi
-                    y_max_orig = roi_offset_y + y_max_roi
+                    all_detections_original_coords.append([x_min_orig, y_min_orig, x_max_orig, y_max_orig, conf, cls_id])
 
-                    # Calculate center coordinates (pixel) of the detected object
-                    center_x_pixel = (x_min_orig + x_max_orig) / 2
-                    center_y_pixel = (y_min_orig + y_max_orig) / 2
+    # --- Apply Global Non-Maximum Suppression (NMS) ---
+    if not all_detections_original_coords:
+        # If no detections, return empty list and original ROI image
+        return [], roi_image_np.copy()
 
-                    detected_trees.append({
-                        'bbox_pixel': [int(x_min_orig), int(y_min_orig), int(x_max_orig), int(y_max_orig)],
-                        'confidence': conf,
-                        'class': class_name,
-                        'center_coords_pixel': (center_x_pixel, center_y_pixel)
-                    })
-                    
-                    # Draw bounding box and center on the display_roi_image for visualization
-                    cv2.rectangle(display_roi_image, (int(x_min_roi), int(y_min_roi)), (int(x_max_roi), int(y_max_roi)), (0, 255, 0), 2) # Green box
-                    cv2.circle(display_roi_image, (int((x_min_roi + x_max_roi) / 2), int((y_min_roi + y_max_roi) / 2)), 3, (0, 0, 255), -1) # Red dot
+    all_detections_np = np.array(all_detections_original_coords)
+    
+    # Extract boxes, scores, and class IDs
+    boxes_np = all_detections_np[:, :4]
+    scores_np = all_detections_np[:, 4]
+    classes_np = all_detections_np[:, 5]
 
-    return detected_trees, display_roi_image
+    # Convert to PyTorch tensors
+    boxes_tensor = torch.from_numpy(boxes_np).float()
+    scores_tensor = torch.from_numpy(scores_np).float()
+    classes_tensor = torch.from_numpy(classes_np).long()
+
+    # Perform NMS per class to ensure different classes don't suppress each other
+    keep_indices = []
+    unique_classes = torch.unique(classes_tensor)
+    for cls_id in unique_classes:
+        # Get indices for the current class
+        class_specific_indices = (classes_tensor == cls_id).nonzero(as_tuple=True)[0]
+        
+        if len(class_specific_indices) > 0:
+            # Get boxes and scores for the current class
+            class_boxes = boxes_tensor[class_specific_indices]
+            class_scores = scores_tensor[class_specific_indices]
+            
+            # Apply NMS using the global IoU threshold
+            nms_retained_indices_in_class = ops.nms(class_boxes, class_scores, iou_threshold)
+            
+            # Map back to original indices
+            keep_indices.extend(class_specific_indices[nms_retained_indices_in_class].tolist())
+
+    # Filter the detections using the indices kept by NMS
+    final_filtered_detections = all_detections_np[keep_indices]
+
+    detected_trees = []
+    # Create a fresh copy of the ROI image for drawing only the NMS-filtered boxes
+    display_roi_image_with_bboxes = roi_image_np.copy()
+
+    # --- Process and draw filtered detections ---
+    for det in final_filtered_detections:
+        x_min_orig, y_min_orig, x_max_orig, y_max_orig, conf, cls_id = det
+        class_name = model.names[int(cls_id)]
+
+        center_x_pixel = (x_min_orig + x_max_orig) / 2
+        center_y_pixel = (y_min_orig + y_max_orig) / 2
+
+        # Convert pixel coordinates to geographic coordinates using the transform
+        center_lon, center_lat = None, None
+        if transform is not None:
+            center_lon, center_lat = rasterio.transform.xy(transform, center_y_pixel, center_x_pixel)
+
+        detected_trees.append({
+            'bbox_pixel': [int(x_min_orig), int(y_min_orig), int(x_max_orig), int(y_max_orig)],
+            'confidence': conf,
+            'class': class_name,
+            'center_coords_pixel': (center_x_pixel, center_y_pixel),
+            'center_coords_geo': (center_lon, center_lat) # Add geographic coordinates
+        })
+        
+        # Draw bounding box and center on the display_roi_image_with_bboxes
+        # Convert original image pixel coordinates back to ROI-relative coordinates for drawing
+        x_min_roi_draw = int(x_min_orig - roi_offset_x)
+        y_min_roi_draw = int(y_min_orig - roi_offset_y)
+        x_max_roi_draw = int(x_max_orig - roi_offset_x)
+        y_max_roi_draw = int(y_max_orig - roi_offset_y)
+        center_x_roi_draw = int(center_x_pixel - roi_offset_x)
+        center_y_roi_draw = int(center_y_pixel - roi_offset_y)
+
+        # Ensure drawing coordinates are within bounds of display_roi_image_with_bboxes
+        x_min_roi_draw = max(0, x_min_roi_draw)
+        y_min_roi_draw = max(0, y_min_roi_draw)
+        x_max_roi_draw = min(roi_width, x_max_roi_draw)
+        y_max_roi_draw = min(roi_height, y_max_roi_draw)
+
+        # Check if coordinates are valid for rectangle drawing
+        if x_min_roi_draw < x_max_roi_draw and y_min_roi_draw < y_max_roi_draw:
+            cv2.rectangle(display_roi_image_with_bboxes, (x_min_roi_draw, y_min_roi_draw), (x_max_roi_draw, y_max_roi_draw), (0, 255, 0), 2) # Green box
+            cv2.circle(display_roi_image_with_bboxes, (center_x_roi_draw, center_y_roi_draw), 3, (0, 0, 255), -1) # Red dot
+
+    return detected_trees, display_roi_image_with_bboxes
+
 
 # --- Streamlit UI Configuration ---
 st.set_page_config(layout="wide") # Use wide layout for better display of large images
@@ -172,18 +240,18 @@ with st.sidebar:
         "Set Confidence Threshold",
         min_value=0.0,
         max_value=1.0,
-        value=0.25, # Default value
+        value=0.5, # Default value
         step=0.05,
         help="Minimum confidence score for a detection to be considered valid (0.0 - 1.0)"
     )
     # Slider for IoU Threshold (for Non-Maximum Suppression)
     iou_threshold = st.slider(
-        "Set IoU Threshold (NMS)",
+        "Set IoU Threshold (Global NMS)",
         min_value=0.0,
         max_value=1.0,
-        value=0.7, # Default value
+        value=0.4, # Default value, often lower for NMS
         step=0.05,
-        help="Maximum Intersection Over Union (IoU) for non-maximum suppression (NMS) to filter overlapping bounding boxes."
+        help="Maximum Intersection Over Union (IoU) for global non-maximum suppression (NMS) to filter overlapping bounding boxes. A lower value means stricter filtering (fewer overlaps)."
     )
 
 # --- Main content area for image display and results ---
@@ -197,9 +265,31 @@ if uploaded_file is not None:
             tmp_file.write(bytes_data)
             temp_image_path = tmp_file.name
 
-        # Open image using PIL (handles both TIFF and PNG)
-        original_image_pil = Image.open(temp_image_path)
-        original_image_np = np.array(original_image_pil)
+        # Open image using rasterio to get georeferencing information
+        # Use rasterio.open for TIFF files to get transform and CRS
+        if uploaded_file.type in ["image/tiff", "image/tif"]:
+            with rasterio.open(temp_image_path) as src:
+                # Read specific bands if it's a multi-band image, assuming RGB order for display/YOLO
+                if src.count >= 3:
+                    # Try to read RGB bands, assuming common order or first 3 bands
+                    try:
+                        # Attempt to read bands 1, 2, 3 as R, G, B
+                        original_image_np = src.read([1, 2, 3]).transpose((1, 2, 0))
+                    except Exception:
+                        # Fallback to reading all bands if specific band reading fails or less than 3 bands
+                        original_image_np = src.read().transpose((1, 2, 0))
+                else: # Grayscale or less than 3 bands
+                    original_image_np = src.read().transpose((1, 2, 0))
+
+                image_transform = src.transform # Geotransform for coordinate transformation
+                image_crs = src.crs # Coordinate Reference System
+            st.info(f"Loaded TIFF with CRS: {image_crs.to_string()}")
+        else: # For PNG or other image types, assume no georeferencing
+            original_image_pil = Image.open(temp_image_path)
+            original_image_np = np.array(original_image_pil)
+            image_transform = None # No transform for non-GeoTIFF
+            image_crs = None
+            st.warning("Non-TIFF file uploaded. Geographic coordinates will not be available.")
         
         # Process image for YOLO (ensure RGB and uint8)
         original_image_np = process_image_for_yolo(original_image_np)
@@ -223,11 +313,7 @@ if uploaded_file is not None:
 
         display_image_for_canvas = cv2.resize(original_image_np, (canvas_width, canvas_height))
         
-        # FIX: Pass PIL Image directly to background_image
-        # The previous error "AttributeError: 'str' object has no attribute 'height'"
-        # suggests that st_canvas expects an image object (like PIL Image) for background_image,
-        # not a base64 string directly, even though its docs might imply it.
-        # Converting to PIL Image from numpy array is the most robust way.
+        # Pass PIL Image directly to background_image
         background_image_pil = Image.fromarray(display_image_for_canvas)
 
         # Use st_canvas for drawing ROI
@@ -295,15 +381,21 @@ if uploaded_file is not None:
 
         # --- Button to start detection ---
         if st.button("Start Tree Detection"):
+            # Check if transform is available for geographic coordinates
+            if uploaded_file.type in ["image/tiff", "image/tif"] and image_transform is None:
+                st.error("Cannot calculate real-world coordinates: Georeferencing information not found or could not be read from the uploaded TIFF file.")
+                st.warning("Please ensure the TIFF file is a valid GeoTIFF.")
+            
             with st.spinner("Detecting trees... Please wait."):
-                # Call the detection function with selected thresholds
+                # Call the detection function with selected thresholds and image_transform
                 detected_trees_list, roi_display_image_with_bboxes = detect_trees_in_roi(
                     model,
                     roi_image,
                     roi_offset_x=roi_x_min,
                     roi_offset_y=roi_y_min,
+                    transform=image_transform, # Pass the georeferencing transform
                     conf_threshold=confidence_threshold, # Pass confidence from slider
-                    iou_threshold=iou_threshold # Pass IoU from slider
+                    iou_threshold=iou_threshold # Pass IoU from slider (now used for global NMS)
                 )
 
             st.subheader("Tree Detection Results")
@@ -313,19 +405,29 @@ if uploaded_file is not None:
             st.image(roi_display_image_with_bboxes, caption="ROI Image with Detections", use_column_width=True)
 
             # Display center coordinates of detected trees
-            st.write("### Tree Center Coordinates (in original image pixels)")
+            st.write("### Tree Center Coordinates")
             if detected_trees_list:
-                tree_data = [
-                    {
+                tree_data = []
+                for i, tree in enumerate(detected_trees_list):
+                    row_data = {
                         "Tree ID": i + 1,
-                        "X_Center": f"{tree['center_coords_pixel'][0]:.2f}",
-                        "Y_Center": f"{tree['center_coords_pixel'][1]:.2f}",
+                        "X_Pixel": f"{tree['center_coords_pixel'][0]:.2f}",
+                        "Y_Pixel": f"{tree['center_coords_pixel'][1]:.2f}",
                         "Confidence": f"{tree['confidence']:.2f}",
                         "Class": tree['class']
                     }
-                    for i, tree in enumerate(detected_trees_list)
-                ]
+                    if 'center_coords_geo' in tree and tree['center_coords_geo'][0] is not None and tree['center_coords_geo'][1] is not None:
+                        row_data["Longitude"] = f"{tree['center_coords_geo'][0]:.6f}"
+                        row_data["Latitude"] = f"{tree['center_coords_geo'][1]:.6f}"
+                    else:
+                        row_data["Longitude"] = "N/A"
+                        row_data["Latitude"] = "N/A"
+                    tree_data.append(row_data)
+                
                 st.dataframe(tree_data, height=300) # Display in a scrollable table
+                
+                if image_crs:
+                    st.info(f"Geographic coordinates are in CRS: {image_crs.to_string()}")
             else:
                 st.warning("No trees found in the selected ROI.")
 
