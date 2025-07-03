@@ -5,7 +5,9 @@ import cv2
 import io
 import tempfile
 import os
+import base64 # Import base64 for image encoding (kept for potential future use or debugging, but not directly used for st_canvas background_image in this fix)
 from ultralytics import YOLO # Import YOLO class
+from streamlit_drawable_canvas import st_canvas # Import the drawable canvas component
 
 # --- Function to load YOLO model ---
 @st.cache_resource
@@ -31,23 +33,17 @@ def process_image_for_yolo(image_np):
     Processes the input image NumPy array to ensure it's in RGB and uint8 format,
     suitable for YOLO inference and display in Streamlit.
     """
-    # st.write(f"DEBUG: Input image_np shape: {image_np.shape}, dtype: {image_np.dtype}") # Debugging line
-
     # Ensure the image has at least 3 dimensions (H, W, C) for color processing
     if image_np.ndim == 2: # Grayscale image (H, W)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_GRAY2RGB)
-        # st.write("DEBUG: Converted grayscale to RGB.") # Debugging line
     elif image_np.shape[2] == 4: # RGBA image (H, W, 4)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
-        # st.write("DEBUG: Converted RGBA to RGB.") # Debugging line
     elif image_np.shape[2] > 4: # Handle cases with more than 4 channels (e.g., multispectral)
         # For display and standard YOLO, we typically only need 3 channels (RGB approximation)
         image_np = image_np[:, :, :3]
-        # st.write("DEBUG: Trimmed image to first 3 channels (assuming RGB).") # Debugging line
 
     # Convert to uint8 and scale if necessary for display and YOLO
     if image_np.dtype != np.uint8:
-        # st.write(f"DEBUG: Converting image dtype from {image_np.dtype} to uint8.") # Debugging line
         if np.issubdtype(image_np.dtype, np.integer) and np.max(image_np) > 255:
             # If it's a higher bit depth integer image (e.g., 16-bit), scale it down to 8-bit (0-255)
             max_val = np.max(image_np)
@@ -55,14 +51,11 @@ def process_image_for_yolo(image_np):
                 image_np = (image_np / max_val * 255).astype(np.uint8)
             else: # Image is all black, just convert to uint8
                 image_np = image_np.astype(np.uint8)
-            # st.write(f"DEBUG: Scaled and converted integer image to uint8. New max: {np.max(image_np)}") # Debugging line
         elif np.issubdtype(image_np.dtype, np.floating):
             # If it's float (e.g., 0.0-1.0), scale to 0-255 and convert to uint8
             image_np = (image_np * 255).astype(np.uint8)
-            # st.write(f"DEBUG: Scaled and converted float image to uint8. New max: {np.max(image_np)}") # Debugging line
         else: # Just convert if it's already in 0-255 range but wrong dtype (e.g., int8)
             image_np = image_np.astype(np.uint8)
-            # st.write(f"DEBUG: Converted image to uint8 without scaling (assuming 0-255 range). New max: {np.max(image_np)}") # Debugging line
 
     return image_np
 
@@ -167,7 +160,7 @@ with st.sidebar:
 
     st.header("Model Settings")
     # Input for model path (default to common YOLOv11 model name)
-    model_path_input = st.text_input("Path to best.pt model file:", "yolov11_count_tree_v1.pt")
+    model_path_input = st.text_input("Path to best.pt model file:", "best.pt")
     
     # Load the YOLO model (cached)
     model = load_yolo_model(model_path_input)
@@ -204,113 +197,137 @@ if uploaded_file is not None:
             tmp_file.write(bytes_data)
             temp_image_path = tmp_file.name
 
-        # st.write(f"DEBUG: Temporary file saved at: {temp_image_path}") # Debugging line
-        
         # Open image using PIL (handles both TIFF and PNG)
         original_image_pil = Image.open(temp_image_path)
         original_image_np = np.array(original_image_pil)
         
-        # st.write(f"DEBUG: Image read by PIL. Shape: {original_image_np.shape}, Dtype: {original_image_np.dtype}") # Debugging line
-
         # Process image for YOLO (ensure RGB and uint8)
         original_image_np = process_image_for_yolo(original_image_np)
-
-        # st.write(f"DEBUG: After process_image_for_yolo. Shape: {original_image_np.shape}, Dtype: {original_image_np.dtype}") # Debugging line
 
         original_height, original_width, _ = original_image_np.shape
         st.write(f"Orthophoto Image Size: {original_width}x{original_height} px")
 
-        st.subheader("Select Region of Interest (ROI)")
-        st.info("You can define ROI coordinates manually below, or use the preview image for an overview.")
+        st.subheader("Select Region of Interest (ROI) by Drawing")
+        st.info("Draw a rectangle on the image below to define your ROI. Only the first drawn rectangle will be used.")
 
-        # --- Display downscaled image for ROI selection preview ---
+        # --- Display downscaled image on canvas for ROI selection ---
         display_scale = 0.2 # Scale down for display, adjust as needed
         # Ensure dimensions are at least 1 to avoid errors for tiny images
-        display_width = max(1, int(original_width * display_scale))
-        display_height = max(1, int(original_height * display_scale))
+        canvas_width = max(1, int(original_width * display_scale))
+        canvas_height = max(1, int(original_height * display_scale))
         
-        # st.write(f"DEBUG: Display image resized to: {display_width}x{display_height}") # Debugging line
-
         # Ensure image is uint8 before resizing for display
         if original_image_np.dtype != np.uint8:
             st.error("Error: Image dtype is not uint8 after processing. Cannot resize for display.")
             st.stop() # Stop execution if image is not in expected format
 
-        display_image = cv2.resize(original_image_np, (display_width, display_height))
+        display_image_for_canvas = cv2.resize(original_image_np, (canvas_width, canvas_height))
         
-        st.image(display_image, caption="Orthophoto Image (Downscaled for Display)", use_column_width=True)
+        # FIX: Pass PIL Image directly to background_image
+        # The previous error "AttributeError: 'str' object has no attribute 'height'"
+        # suggests that st_canvas expects an image object (like PIL Image) for background_image,
+        # not a base64 string directly, even though its docs might imply it.
+        # Converting to PIL Image from numpy array is the most robust way.
+        background_image_pil = Image.fromarray(display_image_for_canvas)
 
-        st.write("---")
-        st.subheader("Define ROI Coordinates (Pixels)")
+        # Use st_canvas for drawing ROI
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 165, 0, 0.3)",  # Orange translucent fill
+            stroke_width=2,
+            stroke_color="rgba(255, 165, 0, 1)", # Orange stroke
+            background_image=background_image_pil, # Pass PIL Image object directly here
+            height=canvas_height,
+            width=canvas_width,
+            drawing_mode="rect", # Allow drawing rectangles
+            key="canvas",
+        )
 
-        # Input fields for ROI coordinates
-        col1, col2 = st.columns(2)
-        with col1:
-            x_min_input = st.number_input("X Min (pixel):", min_value=0, max_value=original_width, value=0, key="xmin")
-            y_min_input = st.number_input("Y Min (pixel):", min_value=0, max_value=original_height, value=0, key="ymin")
-        with col2:
-            x_max_input = st.number_input("X Max (pixel):", min_value=0, max_value=original_width, value=original_width, key="xmax")
-            y_max_input = st.number_input("Y Max (pixel):", min_value=0, max_value=original_height, value=original_height, key="ymax")
+        roi_x_min, roi_y_min, roi_x_max, roi_y_max = 0, 0, original_width, original_height # Default to full image
 
-        # Validate ROI coordinates
-        roi_x_min = min(x_min_input, x_max_input)
-        roi_y_min = min(y_min_input, y_max_input)
-        roi_x_max = max(x_min_input, x_max_input)
-        roi_y_max = max(y_min_input, y_max_input)
+        if canvas_result.json_data is not None:
+            objects = canvas_result.json_data.get("objects", [])
+            if objects:
+                # Get the last drawn object (assuming it's a rectangle)
+                last_object = objects[-1]
+                if last_object["type"] == "rect":
+                    # Coordinates from canvas are relative to the displayed (scaled) image
+                    x_on_canvas = last_object["left"]
+                    y_on_canvas = last_object["top"]
+                    width_on_canvas = last_object["width"]
+                    height_on_canvas = last_object["height"]
 
-        if roi_x_max <= roi_x_min or roi_y_max <= roi_y_min:
-            st.warning("Invalid ROI coordinates: Xmax must be greater than Xmin, and Ymax must be greater than Ymin.")
-        else:
-            st.success(f"Selected ROI: ({roi_x_min},{roi_y_min}) - ({roi_x_max},{roi_y_max})")
+                    # Scale coordinates back to original image dimensions
+                    roi_x_min = int(x_on_canvas / display_scale)
+                    roi_y_min = int(y_on_canvas / display_scale)
+                    roi_x_max = int((x_on_canvas + width_on_canvas) / display_scale)
+                    roi_y_max = int((y_on_canvas + height_on_canvas) / display_scale)
 
-            # --- Crop ROI image and display preview ---
-            # Ensure ROI coordinates are within image bounds before cropping
-            roi_x_min = max(0, roi_x_min)
-            roi_y_min = max(0, roi_y_min)
-            roi_x_max = min(original_width, roi_x_max)
-            roi_y_max = min(original_height, roi_y_max)
+                    # Ensure coordinates are within original image bounds
+                    roi_x_min = max(0, roi_x_min)
+                    roi_y_min = max(0, roi_y_min)
+                    roi_x_max = min(original_width, roi_x_max)
+                    roi_y_max = min(original_height, roi_y_max)
 
-            roi_image = original_image_np[roi_y_min:roi_y_max, roi_x_min:roi_x_max].copy()
-            
-            # st.write(f"DEBUG: ROI image shape: {roi_image.shape}, Dtype: {roi_image.dtype}") # Debugging line
-            
-            st.image(roi_image, caption=f"Selected ROI Image ({roi_image.shape[1]}x{roi_image.shape[0]} px)", use_column_width=True)
-
-            # --- Button to start detection ---
-            if st.button("Start Tree Detection"):
-                with st.spinner("Detecting trees... Please wait."):
-                    # Call the detection function with selected thresholds
-                    detected_trees_list, roi_display_image_with_bboxes = detect_trees_in_roi(
-                        model,
-                        roi_image,
-                        roi_offset_x=roi_x_min,
-                        roi_offset_y=roi_y_min,
-                        conf_threshold=confidence_threshold, # Pass confidence from slider
-                        iou_threshold=iou_threshold # Pass IoU from slider
-                    )
-
-                st.subheader("Tree Detection Results")
-                st.write(f"Total trees detected: **{len(detected_trees_list)}** trees")
-
-                # Display ROI image with bounding boxes
-                st.image(roi_display_image_with_bboxes, caption="ROI Image with Detections", use_column_width=True)
-
-                # Display center coordinates of detected trees
-                st.write("### Tree Center Coordinates (in original image pixels)")
-                if detected_trees_list:
-                    tree_data = [
-                        {
-                            "Tree ID": i + 1,
-                            "X_Center": f"{tree['center_coords_pixel'][0]:.2f}",
-                            "Y_Center": f"{tree['center_coords_pixel'][1]:.2f}",
-                            "Confidence": f"{tree['confidence']:.2f}",
-                            "Class": tree['class']
-                        }
-                        for i, tree in enumerate(detected_trees_list)
-                    ]
-                    st.dataframe(tree_data, height=300) # Display in a scrollable table
+                    st.success(f"Selected ROI: ({roi_x_min},{roi_y_min}) - ({roi_x_max},{roi_y_max})")
                 else:
-                    st.warning("No trees found in the selected ROI.")
+                    st.warning("Please draw a rectangle to define the ROI.")
+            else:
+                st.info("Draw a rectangle on the image above to define the ROI.")
+        else:
+            st.info("Draw a rectangle on the image above to define the ROI.")
+
+        # --- Crop ROI image and display preview (using drawn ROI or default) ---
+        # Ensure ROI coordinates are within image bounds before cropping
+        roi_x_min = max(0, roi_x_min)
+        roi_y_min = max(0, roi_y_min)
+        roi_x_max = min(original_width, roi_x_max)
+        roi_y_max = min(original_height, roi_y_max)
+
+        # Check if a valid ROI was selected, otherwise use full image
+        if roi_x_max > roi_x_min and roi_y_max > roi_y_min:
+            roi_image = original_image_np[roi_y_min:roi_y_max, roi_x_min:roi_x_max].copy()
+            st.image(roi_image, caption=f"Selected ROI Image ({roi_image.shape[1]}x{roi_image.shape[0]} px)", use_column_width=True)
+        else:
+            st.warning("No valid ROI drawn or selected. Processing the full image.")
+            roi_image = original_image_np.copy()
+            roi_x_min, roi_y_min = 0, 0 # Reset offsets for full image processing
+
+
+        # --- Button to start detection ---
+        if st.button("Start Tree Detection"):
+            with st.spinner("Detecting trees... Please wait."):
+                # Call the detection function with selected thresholds
+                detected_trees_list, roi_display_image_with_bboxes = detect_trees_in_roi(
+                    model,
+                    roi_image,
+                    roi_offset_x=roi_x_min,
+                    roi_offset_y=roi_y_min,
+                    conf_threshold=confidence_threshold, # Pass confidence from slider
+                    iou_threshold=iou_threshold # Pass IoU from slider
+                )
+
+            st.subheader("Tree Detection Results")
+            st.write(f"Total trees detected: **{len(detected_trees_list)}** trees")
+
+            # Display ROI image with bounding boxes
+            st.image(roi_display_image_with_bboxes, caption="ROI Image with Detections", use_column_width=True)
+
+            # Display center coordinates of detected trees
+            st.write("### Tree Center Coordinates (in original image pixels)")
+            if detected_trees_list:
+                tree_data = [
+                    {
+                        "Tree ID": i + 1,
+                        "X_Center": f"{tree['center_coords_pixel'][0]:.2f}",
+                        "Y_Center": f"{tree['center_coords_pixel'][1]:.2f}",
+                        "Confidence": f"{tree['confidence']:.2f}",
+                        "Class": tree['class']
+                    }
+                    for i, tree in enumerate(detected_trees_list)
+                ]
+                st.dataframe(tree_data, height=300) # Display in a scrollable table
+            else:
+                st.warning("No trees found in the selected ROI.")
 
     except Exception as e:
         st.error(f"An error occurred during image processing: {e}")
@@ -322,3 +339,4 @@ if uploaded_file is not None:
             os.remove(temp_image_path)
 else:
     st.info("Please upload an Orthophoto (.tiff, .png) file to begin.")
+
